@@ -52,6 +52,18 @@ type worker struct {
 	done   chan struct{}
 }
 
+func (w *worker) recordStackTrace() {
+	f, err := os.CreateTemp("", "hang-stack-trace-")
+	if err != nil { return }
+	defer f.Close()
+	output, err := exec.Command("eu-stack", "-p", fmt.Sprintf("%d", w.pid)).Output()
+	if err != nil {
+		log.Printf("Tried to capture stack trace for pid %d (and save it to %s) but failed with %v", w.pid, f.Name(), err)
+		return
+	}
+	f.Write(output)
+}
+
 // watch monitors the worker until it dies.
 func (w *worker) watch() {
 	go func() {
@@ -114,6 +126,11 @@ func spawnWorker(ctx context.Context, port int, command string, args ...string) 
 		return w
 	}
 	w.pid = w.cmd.Process.Pid
+	w.cancel = func() {
+		w.cmd.Process.Signal(os.Interrupt)
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}
 	go w.watch()
 	return w
 }
@@ -321,6 +338,7 @@ func main() {
 			if r.Context().Err() != nil {
 				log.Printf("worker %v: restarting due to timeout", w.pid)
 				workerRestartsCounter.Inc()
+				w.recordStackTrace()
 				w.cancel()
 				_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
 					"error": fmt.Sprintf("worker %v: restarted due to timeout", w.pid),
