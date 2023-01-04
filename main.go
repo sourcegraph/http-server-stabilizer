@@ -233,6 +233,7 @@ func (s *stabilizer) director(req *http.Request) {
 		}
 	}
 
+	// We cannot cancel this timeout effectively within http.ReverseProxy director
 	ctx, _ := context.WithTimeout(req.Context(), timeout)
 	*req = *req.WithContext(ctx)
 
