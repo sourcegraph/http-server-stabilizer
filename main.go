@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -22,11 +21,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sourcegraph/log"
+
 	oldfreeport "github.com/phayes/freeport"
-	freeport "github.com/slimsag/freeport"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	freeport "github.com/slimsag/freeport"
 )
 
 var (
@@ -43,6 +44,9 @@ var (
 )
 
 type worker struct {
+	// log is a logger that carries the worker's pid and port as a fields
+	log log.Logger
+
 	ctx    context.Context
 	port   int
 	cancel func()
@@ -60,7 +64,7 @@ func (w *worker) watch() {
 		// Kill the process.
 		if err := w.cmd.Process.Kill(); err != nil {
 			if err != nil {
-				log.Printf("worker %v: killing process: %v", w.pid, err)
+				w.log.Error("killing process", log.Error(err))
 			}
 		}
 
@@ -78,9 +82,11 @@ func (w *worker) watch() {
 	output := bufio.NewReader(w.output)
 	for {
 		line, err := output.ReadString('\n')
-		log.Printf("worker %v: %s", w.pid, line)
+		w.log.Info(line)
 		if err != nil {
-			log.Printf("worker %v: %s", w.pid, w.cmd.ProcessState)
+			w.log.Error("read error",
+				log.Error(err),
+				log.String("process.state", w.cmd.ProcessState.String()))
 			return
 		}
 	}
@@ -89,7 +95,7 @@ func (w *worker) watch() {
 // spawnWorker spawns a new worker process. stderr and stdout will be logged,
 // the done channel signals when the worker has died, and w.cancel() can be
 // used to kill the worker.
-func spawnWorker(ctx context.Context, port int, command string, args ...string) *worker {
+func spawnWorker(ctx context.Context, logger log.Logger, port int, command string, args ...string) *worker {
 	ctx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -101,6 +107,8 @@ func spawnWorker(ctx context.Context, port int, command string, args ...string) 
 	cmd.Stderr = pw
 	cmd.Stdout = pw
 	w := &worker{
+		log: logger.With(log.Int("port", port)),
+
 		ctx:    ctx,
 		port:   port,
 		cancel: cancel,
@@ -108,17 +116,25 @@ func spawnWorker(ctx context.Context, port int, command string, args ...string) 
 		output: pr,
 		done:   make(chan struct{}),
 	}
+
 	if err := cmd.Start(); err != nil {
-		log.Printf("worker spawn: error: %v", err)
+		logger.Error("spawn error", log.Error(err))
 		close(w.done)
 		return w
 	}
+
+	// Track the process ID associated with this worker
 	w.pid = w.cmd.Process.Pid
+	w.log = w.log.With(log.Int("pid", w.pid))
+
 	go w.watch()
+
+	w.log.Info("started")
 	return w
 }
 
 type stabilizer struct {
+	log     log.Logger
 	command string
 	args    []string
 
@@ -161,23 +177,27 @@ func getFreePort() (port int, err error) {
 // ensureWorkers ensures that n workers are always alive. If they die, they
 // will be started again.
 func (s *stabilizer) ensureWorkers(n int) {
-	log.Printf("worker command: %s", strings.Join(append([]string{s.command}, s.args...), " "))
+	s.log.Info("ensuring workers",
+		log.String("command", strings.Join(append([]string{s.command}, s.args...), " ")),
+		log.Int("count", n))
+
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			for {
 				workerPort, err := getFreePort()
 				if err != nil {
-					log.Println("failed to find free port")
+					s.log.Warn("failed to find free port")
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
 				args := templateArgs(s.args, fmt.Sprint(workerPort))
-				w := spawnWorker(context.Background(), workerPort, s.command, args...)
+				w := spawnWorker(context.Background(),
+					log.Scoped("worker", "worker instance"),
+					workerPort, s.command, args...)
 				s.workerByPortMu.Lock()
 				s.workerByPort[workerPort] = w
 				s.workerByPortMu.Unlock()
-				log.Printf("worker %v: started on port %v", w.pid, workerPort)
 				var (
 					done        bool
 					poolEntries int
@@ -219,7 +239,9 @@ func (s *stabilizer) director(req *http.Request) {
 	// Pull a worker from the pool and set it as our target.
 	worker := s.acquire()
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%v", worker.port))
-	log.Println("request", req.URL, target)
+	s.log.Debug("handling request",
+		log.String("url", req.URL.String()),
+		log.String("target", target.String()))
 
 	// Copy what httputil.NewSingleHostReverseProxy would do.
 	req.URL.Scheme = target.Scheme
@@ -241,17 +263,26 @@ var workerRestartsCounter prometheus.Counter
 func main() {
 	flag.Parse()
 
+	liblog := log.Init(log.Resource{
+		Name:       *flagPrometheusAppName,
+		InstanceID: hostname(),
+		Version:    "",
+	})
+	defer liblog.Sync()
+
 	workerRestartsCounter = promauto.NewCounter(prometheus.CounterOpts{
 		Name: *flagPrometheusAppName + "_hss_worker_restarts",
 		Help: "The total number of worker process restarts",
 	})
 
 	if *flagDemo {
-		log.Println("demo: listening at", *flagDemoListen)
+		demoLog := log.Scoped("demo", "demo endpoint")
+
+		demoLog.Info("listening", log.String("addr", *flagDemoListen))
 		rand.Seed(time.Now().UnixNano())
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if rand.Int()%2 == 0 {
-				fmt.Println("stuck!")
+				demoLog.Warn("stuck")
 				i := 0
 				for {
 					// Pretend the server OS thread has gotten completely stuck in a loop.
@@ -263,7 +294,10 @@ func main() {
 			}
 			fmt.Fprintf(w, "Hello from worker %s\n", *flagDemoListen)
 		})
-		log.Fatal(http.ListenAndServe(*flagDemoListen, nil))
+
+		if err := http.ListenAndServe(*flagDemoListen, nil); err != nil {
+			demoLog.Fatal("server exited", log.Error(err))
+		}
 	}
 
 	if flag.NArg() < 2 {
@@ -280,6 +314,7 @@ func main() {
 	}
 
 	s := &stabilizer{
+		log:          log.Scoped("stabilizer", "worker stabilizer"),
 		command:      flag.Arg(0),
 		args:         flag.Args()[1:],
 		workerPool:   make(chan *worker, *flagWorkers**flagConcurrency),
@@ -318,8 +353,8 @@ func main() {
 			rw.WriteHeader(http.StatusServiceUnavailable)
 			// If the request timed out, kill the worker since it may be stuck.
 			// It will automatically restart.
-			if r.Context().Err() != nil {
-				log.Printf("worker %v: restarting due to timeout", w.pid)
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				w.log.Warn("restarting due to timeout", log.String("ctxErr", ctxErr.Error()))
 				workerRestartsCounter.Inc()
 				w.cancel()
 				_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
@@ -337,12 +372,14 @@ func main() {
 			// worker timing out. In this case, having a different error code
 			// to handle is not that useful so we also return
 			// hss_worker_timeout.
-			log.Printf("worker %v: %v", w.pid, err)
+			w.log.Error("error encountered", log.Error(err))
 			_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
 				"error": fmt.Sprintf("worker %v: %v", w.pid, err),
 				"code":  "hss_worker_timeout",
 			})
 		},
 	}
-	log.Fatal(http.ListenAndServe(*flagListen, handler))
+	if err := http.ListenAndServe(*flagListen, handler); err != nil {
+		log.Scoped("server", "").Fatal("server exited", log.Error(err))
+	}
 }
