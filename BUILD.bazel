@@ -1,0 +1,29 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@bazel_gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix github.com/sourcegraph/http-server-stabilizer
+gazelle(name = "gazelle")
+
+go_library(
+    name = "http-server-stabilizer_lib",
+    srcs = [
+        "hostname.go",
+        "main.go",
+    ],
+    importpath = "github.com/sourcegraph/http-server-stabilizer",
+    visibility = ["//visibility:private"],
+    deps = [
+        "@com_github_phayes_freeport//:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus/promauto:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus/promhttp:go_default_library",
+        "@com_github_slimsag_freeport//:go_default_library",
+        "@com_github_sourcegraph_log//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "http-server-stabilizer",
+    embed = [":http-server-stabilizer_lib"],
+    visibility = ["//visibility:public"],
+)
