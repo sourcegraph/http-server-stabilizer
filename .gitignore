@@ -1,1 +1,3 @@
 http-server-stabilizer
+# Bazel
+bazel-*
