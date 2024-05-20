@@ -352,6 +352,18 @@ func main() {
 			rw.Header().Set("X-Worker", fmt.Sprint(w.pid))
 
 			rw.WriteHeader(http.StatusServiceUnavailable)
+
+			// This error type matches what Rocket uses (the Rust server
+			// we use in syntect server)
+			type Err struct {
+				// HTTP error code
+				Code int `json:"code"`
+				// Error string that can be matched on
+				Reason string `json:"reason"`
+				// PII-safe human-readable description, which can be used for logging
+				Description string `json:"description"`
+			}
+
 			// If the request timed out, kill the worker since it may be stuck.
 			// It will automatically restart.
 			if ctxErr := r.Context().Err(); ctxErr != nil {
@@ -359,8 +371,11 @@ func main() {
 				workerRestartsCounter.Inc()
 				w.cancel()
 				_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
-					"error": fmt.Sprintf("worker %v: restarted due to timeout", w.pid),
-					"code":  "hss_worker_timeout",
+					"error": Err{
+						Code:        http.StatusServiceUnavailable,
+						Reason:      "hss_worker_timeout",
+						Description: fmt.Sprintf("Worker (pid: %v) failed to highlight file; restarting it", w.pid),
+					},
 				})
 				return
 			}
@@ -375,8 +390,11 @@ func main() {
 			// hss_worker_timeout.
 			w.log.Error("error encountered", log.Error(err))
 			_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
-				"error": fmt.Sprintf("worker %v: %v", w.pid, err),
-				"code":  "hss_worker_timeout",
+				"error": Err{
+					Code:        http.StatusServiceUnavailable,
+					Reason:      "hss_worker_unknown_error",
+					Description: fmt.Sprintf("Worker (pid: %v) unknown error: %v", w.pid, err),
+				},
 			})
 		},
 	}
