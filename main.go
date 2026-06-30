@@ -181,7 +181,7 @@ func (s *stabilizer) ensureWorkers(n int) {
 		log.String("command", strings.Join(append([]string{s.command}, s.args...), " ")),
 		log.Int("count", n))
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go func(i int) {
 			for {
 				workerPort, err := getFreePort()
@@ -370,7 +370,7 @@ func main() {
 				w.log.Warn("restarting due to timeout", log.String("ctxErr", ctxErr.Error()))
 				workerRestartsCounter.Inc()
 				w.cancel()
-				_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
+				_ = json.NewEncoder(rw).Encode(&map[string]any{
 					"error": Err{
 						Code:        http.StatusServiceUnavailable,
 						Reason:      "hss_worker_timeout",
@@ -389,7 +389,7 @@ func main() {
 			// to handle is not that useful so we also return
 			// hss_worker_timeout.
 			w.log.Error("error encountered", log.Error(err))
-			_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
+			_ = json.NewEncoder(rw).Encode(&map[string]any{
 				"error": Err{
 					Code:        http.StatusServiceUnavailable,
 					Reason:      "hss_worker_unknown_error",
