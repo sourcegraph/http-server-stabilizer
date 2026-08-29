@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
@@ -38,6 +40,8 @@ var (
 	flagConcurrency       = flag.Int("concurrency", 10, "number of concurrent requests to allow per worker")
 	flagPrometheus        = flag.String("prometheus", ":6060", "publish Prometheus metrics on specified address")
 	flagPrometheusAppName = flag.String("prometheus-app-name", "", "App name to specify in Prometheus")
+	flagPreShutdownPause  = flag.Duration("pre-shutdown-pause", 0, "time to continue accepting requests after SIGTERM before shutting down")
+	flagGracefulTimeout   = flag.Duration("graceful-shutdown-timeout", 10*time.Second, "maximum total time for the pre-shutdown pause and in-flight request drain")
 
 	flagDemo       = flag.Bool("demo", false, "start an HTTP demo server that does nothing")
 	flagDemoListen = flag.String("demo-listen", ":9700", "specify HTTP address for demo server to listen on")
@@ -52,44 +56,62 @@ type worker struct {
 	cancel func()
 	pid    int
 	cmd    *exec.Cmd
-	output *io.PipeReader
+	output *os.File
 	done   chan struct{}
+}
+
+func (w *worker) killProcessGroup() {
+	// Setpgid makes the leader PID the process group ID. Address the group by
+	// that stable ID even if the leader has already exited and been reaped.
+	if err := syscall.Kill(-w.pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		w.log.Error("killing process group", log.Error(err))
+	}
 }
 
 // watch monitors the worker until it dies.
 func (w *worker) watch() {
+	outputDone := make(chan struct{})
 	go func() {
-		<-w.ctx.Done()
-
-		// Kill the process.
-		if err := w.cmd.Process.Kill(); err != nil {
+		defer close(outputDone)
+		output := bufio.NewReader(w.output)
+		for {
+			line, err := output.ReadString('\n')
+			if line != "" {
+				w.log.Info(strings.TrimSuffix(line, "\n"))
+			}
 			if err != nil {
-				w.log.Error("killing process", log.Error(err))
+				if err != io.EOF && !errors.Is(err, os.ErrClosed) && w.ctx.Err() == nil {
+					w.log.Error("reading process output", log.Error(err))
+				}
+				return
 			}
 		}
-
-		// Also kill subprocesses (OS X, Linux) -- not supported on Windows.
-		pgid, err := syscall.Getpgid(w.pid)
-		if err == nil {
-			syscall.Kill(-pgid, 15)
-		}
-
-		w.cmd.ProcessState, _ = w.cmd.Process.Wait()
-		close(w.done)
-		w.output.Close()
 	}()
 
-	output := bufio.NewReader(w.output)
-	for {
-		line, err := output.ReadString('\n')
-		w.log.Info(line)
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- w.cmd.Wait()
+	}()
+
+	select {
+	case <-w.ctx.Done():
+		w.killProcessGroup()
+		err := <-waitDone
 		if err != nil {
-			w.log.Error("read error",
-				log.Error(err),
-				log.String("process.state", w.cmd.ProcessState.String()))
-			return
+			w.log.Debug("worker stopped", log.Error(err))
+		}
+	case err := <-waitDone:
+		// A worker leader can exit while descendants remain alive. Cancel its
+		// routing context and terminate every remaining group member.
+		w.cancel()
+		w.killProcessGroup()
+		if err != nil {
+			w.log.Warn("worker exited", log.Error(err))
 		}
 	}
+	w.output.Close()
+	<-outputDone
+	close(w.done)
 }
 
 // spawnWorker spawns a new worker process. stderr and stdout will be logged,
@@ -97,13 +119,20 @@ func (w *worker) watch() {
 // used to kill the worker.
 func spawnWorker(ctx context.Context, logger log.Logger, port int, command string, args ...string) *worker {
 	ctx, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(ctx, command, args...)
+	cmd := exec.Command(command, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// Create a new process group so any subprocesses the worker spawns can
 		// be killed.
 		Setpgid: true,
 	}
-	pr, pw := io.Pipe()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		logger.Error("creating worker output pipe", log.Error(err))
+		cancel()
+		done := make(chan struct{})
+		close(done)
+		return &worker{ctx: ctx, cancel: cancel, done: done}
+	}
 	cmd.Stderr = pw
 	cmd.Stdout = pw
 	w := &worker{
@@ -119,9 +148,15 @@ func spawnWorker(ctx context.Context, logger log.Logger, port int, command strin
 
 	if err := cmd.Start(); err != nil {
 		logger.Error("spawn error", log.Error(err))
+		cancel()
+		pw.Close()
+		pr.Close()
 		close(w.done)
 		return w
 	}
+	// The child inherited the write descriptor. The parent must not retain it,
+	// otherwise worker output never reaches EOF.
+	pw.Close()
 
 	// Track the process ID associated with this worker
 	w.pid = w.cmd.Process.Pid
@@ -176,23 +211,32 @@ func getFreePort() (port int, err error) {
 
 // ensureWorkers ensures that n workers are always alive. If they die, they
 // will be started again.
-func (s *stabilizer) ensureWorkers(n int) {
+func (s *stabilizer) ensureWorkers(ctx context.Context, wg *sync.WaitGroup, n int) {
 	s.log.Info("ensuring workers",
 		log.String("command", strings.Join(append([]string{s.command}, s.args...), " ")),
 		log.Int("count", n))
 
 	for i := 0; i < n; i++ {
+		wg.Add(1)
 		go func(i int) {
+			defer wg.Done()
 			for {
+				if ctx.Err() != nil {
+					return
+				}
 				workerPort, err := getFreePort()
 				if err != nil {
 					s.log.Warn("failed to find free port")
-					time.Sleep(1 * time.Second)
+					select {
+					case <-time.After(1 * time.Second):
+					case <-ctx.Done():
+						return
+					}
 					continue
 				}
 
 				args := templateArgs(s.args, fmt.Sprint(workerPort))
-				w := spawnWorker(context.Background(),
+				w := spawnWorker(ctx,
 					log.Scoped("worker", "worker instance"),
 					workerPort, s.command, args...)
 				s.workerByPortMu.Lock()
@@ -212,15 +256,109 @@ func (s *stabilizer) ensureWorkers(n int) {
 							poolEntries++
 						case <-w.done:
 							done = true
+						case <-ctx.Done():
+							<-w.done
+							return
 						}
 						continue
 					}
-					<-w.done
+					select {
+					case <-w.done:
+					case <-ctx.Done():
+						<-w.done
+						return
+					}
 					break
 				}
 			}
 		}(i)
 	}
+}
+
+var errForcedShutdown = fmt.Errorf("shutdown forced")
+
+const workerCleanupTimeout = 5 * time.Second
+
+func serveUntilShutdown(
+	logger log.Logger,
+	server *http.Server,
+	listener net.Listener,
+	stopWorkers func(),
+	waitWorkers func(),
+	signals <-chan os.Signal,
+	preShutdownPause time.Duration,
+	gracefulTimeout time.Duration,
+) (returnErr error) {
+	defer func() {
+		stopWorkers()
+		workersDone := make(chan struct{})
+		go func() {
+			waitWorkers()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-time.After(workerCleanupTimeout):
+			logger.Error("worker cleanup deadline reached")
+			if returnErr == nil {
+				returnErr = fmt.Errorf("worker cleanup deadline reached")
+			}
+		}
+		if returnErr == nil {
+			logger.Info("graceful shutdown complete")
+		}
+	}()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+
+	select {
+	case err := <-serveDone:
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	case sig := <-signals:
+		logger.Info("shutdown signal received; continuing to accept requests during pre-shutdown pause",
+			log.String("signal", sig.String()),
+			log.Duration("pause", preShutdownPause),
+			log.Duration("gracefulTimeout", gracefulTimeout))
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), gracefulTimeout)
+	defer cancelShutdown()
+	pause := time.NewTimer(preShutdownPause)
+	defer pause.Stop()
+	select {
+	case sig := <-signals:
+		logger.Warn("second shutdown signal received during pre-shutdown pause; forcing shutdown", log.String("signal", sig.String()))
+		_ = server.Close()
+		return errForcedShutdown
+	case <-shutdownCtx.Done():
+		logger.Warn("graceful shutdown deadline reached during pre-shutdown pause; forcing shutdown", log.Error(shutdownCtx.Err()))
+		_ = server.Close()
+		return shutdownCtx.Err()
+	case <-pause.C:
+	}
+
+	logger.Info("pre-shutdown pause complete; refusing new connections and draining in-flight requests")
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- server.Shutdown(shutdownCtx) }()
+
+	var shutdownErr error
+	select {
+	case shutdownErr = <-shutdownDone:
+		if shutdownErr != nil {
+			logger.Warn("graceful shutdown deadline reached; forcing shutdown", log.Error(shutdownErr))
+			_ = server.Close()
+		}
+	case sig := <-signals:
+		logger.Warn("second shutdown signal received while draining; forcing shutdown", log.String("signal", sig.String()))
+		_ = server.Close()
+		shutdownErr = errForcedShutdown
+	}
+
+	return shutdownErr
 }
 
 func (s *stabilizer) director(req *http.Request) {
@@ -321,7 +459,9 @@ func main() {
 		workerPool:   make(chan *worker, *flagWorkers**flagConcurrency),
 		workerByPort: make(map[int]*worker),
 	}
-	go s.ensureWorkers(*flagWorkers)
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	var workerWG sync.WaitGroup
+	s.ensureWorkers(workerCtx, &workerWG, *flagWorkers)
 
 	handler := &httputil.ReverseProxy{
 		Director: s.director,
@@ -398,7 +538,25 @@ func main() {
 			})
 		},
 	}
-	if err := http.ListenAndServe(*flagListen, handler); err != nil {
-		log.Scoped("server", "").Fatal("server exited", log.Error(err))
+	listener, err := net.Listen("tcp", *flagListen)
+	if err != nil {
+		log.Scoped("server", "").Fatal("failed to listen", log.Error(err))
+	}
+	server := &http.Server{Handler: handler}
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	if err := serveUntilShutdown(
+		log.Scoped("server", "HTTP server"),
+		server,
+		listener,
+		stopWorkers,
+		workerWG.Wait,
+		signals,
+		*flagPreShutdownPause,
+		*flagGracefulTimeout,
+	); err != nil {
+		log.Scoped("server", "").Error("server exited", log.Error(err))
+		os.Exit(1)
 	}
 }

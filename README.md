@@ -45,6 +45,14 @@ http-server-stabilizer -- http-server-stabilizer -demo -demo-listen ':{{.Port}}'
 
 The `-timeout=10s` flag can be used to control how long rogue requests can go for. You can also control the timeout via a request header: `X-Stabilize-Timeout: 20s`.
 
+## Graceful shutdown
+
+On SIGTERM or SIGINT, the stabilizer continues accepting requests for
+`-pre-shutdown-pause` (default `0s`). It then closes its listener and drains in-flight
+requests until the total `-graceful-shutdown-timeout` (default `10s`) measured from signal
+receipt expires. Workers are stopped only after the HTTP drain completes. Worker cleanup
+has a final five-second bound. A second signal skips the remaining pause and drain.
+
 ## Debugging
 
 All responses include a `X-Worker` header which is a PID correlating to the `http-server-stabilizer` worker PID for debugging purposes (so you can trace a specific request back to a specific worker process).

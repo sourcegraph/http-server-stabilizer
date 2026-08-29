@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@bazel_gazelle//:def.bzl", "gazelle")
 
 # gazelle:prefix github.com/sourcegraph/http-server-stabilizer
@@ -26,4 +26,10 @@ go_binary(
     name = "http-server-stabilizer",
     embed = [":http-server-stabilizer_lib"],
     visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "http-server-stabilizer_test",
+    srcs = ["main_test.go"],
+    embed = [":http-server-stabilizer_lib"],
 )
