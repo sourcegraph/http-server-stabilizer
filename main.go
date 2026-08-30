@@ -68,6 +68,12 @@ func (w *worker) killProcessGroup() {
 	}
 }
 
+func (w *worker) reapProcessGroup() {
+	if err := reapProcessGroup(w.pid); err != nil {
+		w.log.Error("reaping process group", log.Error(err))
+	}
+}
+
 // watch monitors the worker until it dies.
 func (w *worker) watch() {
 	outputDone := make(chan struct{})
@@ -97,6 +103,7 @@ func (w *worker) watch() {
 	case <-w.ctx.Done():
 		w.killProcessGroup()
 		err := <-waitDone
+		w.reapProcessGroup()
 		if err != nil {
 			w.log.Debug("worker stopped", log.Error(err))
 		}
@@ -105,6 +112,7 @@ func (w *worker) watch() {
 		// routing context and terminate every remaining group member.
 		w.cancel()
 		w.killProcessGroup()
+		w.reapProcessGroup()
 		if err != nil {
 			w.log.Warn("worker exited", log.Error(err))
 		}
@@ -173,10 +181,10 @@ type stabilizer struct {
 	command string
 	args    []string
 
-	workerPool     chan *worker
-	workerByPortMu sync.RWMutex
-	workerByPort   map[int]*worker
+	workerPool chan *worker
 }
+
+type workerContextKey struct{}
 
 func templateArgs(args []string, port string) []string {
 	var v []string
@@ -239,9 +247,6 @@ func (s *stabilizer) ensureWorkers(ctx context.Context, wg *sync.WaitGroup, n in
 				w := spawnWorker(ctx,
 					log.Scoped("worker", "worker instance"),
 					workerPort, s.command, args...)
-				s.workerByPortMu.Lock()
-				s.workerByPort[workerPort] = w
-				s.workerByPortMu.Unlock()
 				var (
 					done        bool
 					poolEntries int
@@ -312,6 +317,7 @@ func serveUntilShutdown(
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
 
+	var shutdownStarted time.Time
 	select {
 	case err := <-serveDone:
 		if err == http.ErrServerClosed {
@@ -319,13 +325,14 @@ func serveUntilShutdown(
 		}
 		return err
 	case sig := <-signals:
+		shutdownStarted = time.Now()
 		logger.Info("shutdown signal received; continuing to accept requests during pre-shutdown pause",
 			log.String("signal", sig.String()),
 			log.Duration("pause", preShutdownPause),
 			log.Duration("gracefulTimeout", gracefulTimeout))
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), gracefulTimeout)
+	shutdownCtx, cancelShutdown := context.WithDeadline(context.Background(), shutdownStarted.Add(gracefulTimeout))
 	defer cancelShutdown()
 	pause := time.NewTimer(preShutdownPause)
 	defer pause.Stop()
@@ -377,6 +384,7 @@ func (s *stabilizer) director(req *http.Request) {
 
 	// Pull a worker from the pool and set it as our target.
 	worker := s.acquire()
+	*req = *req.WithContext(context.WithValue(req.Context(), workerContextKey{}, worker))
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%v", worker.port))
 	s.log.Debug("handling request",
 		log.String("url", req.URL.String()),
@@ -443,6 +451,12 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if err := enableChildSubreaper(); err != nil {
+		log.Scoped("server", "").Fatal("enabling child process reaper", log.Error(err))
+	}
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
 
 	if *flagPrometheus != "" {
 		go func() {
@@ -453,11 +467,10 @@ func main() {
 	}
 
 	s := &stabilizer{
-		log:          log.Scoped("stabilizer", "worker stabilizer"),
-		command:      flag.Arg(0),
-		args:         flag.Args()[1:],
-		workerPool:   make(chan *worker, *flagWorkers**flagConcurrency),
-		workerByPort: make(map[int]*worker),
+		log:        log.Scoped("stabilizer", "worker stabilizer"),
+		command:    flag.Arg(0),
+		args:       flag.Args()[1:],
+		workerPool: make(chan *worker, *flagWorkers**flagConcurrency),
 	}
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	var workerWG sync.WaitGroup
@@ -474,20 +487,14 @@ func main() {
 		},
 		ModifyResponse: func(r *http.Response) error {
 			// Set the X-Worker response header for debugging purposes.
-			workerPort, _ := strconv.ParseInt(r.Request.URL.Port(), 10, 64)
-			s.workerByPortMu.RLock()
-			w := s.workerByPort[int(workerPort)]
-			s.workerByPortMu.RUnlock()
+			w := r.Request.Context().Value(workerContextKey{}).(*worker)
 			s.release(w)
 			r.Header.Set("X-Worker", fmt.Sprint(w.pid))
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
 			// Set the X-Worker response header for debugging purposes.
-			workerPort, _ := strconv.ParseInt(r.URL.Port(), 10, 64)
-			s.workerByPortMu.RLock()
-			w := s.workerByPort[int(workerPort)]
-			s.workerByPortMu.RUnlock()
+			w := r.Context().Value(workerContextKey{}).(*worker)
 			s.release(w)
 			rw.Header().Set("X-Worker", fmt.Sprint(w.pid))
 
@@ -543,9 +550,6 @@ func main() {
 		log.Scoped("server", "").Fatal("failed to listen", log.Error(err))
 	}
 	server := &http.Server{Handler: handler}
-	signals := make(chan os.Signal, 2)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(signals)
 	if err := serveUntilShutdown(
 		log.Scoped("server", "HTTP server"),
 		server,

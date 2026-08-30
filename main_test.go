@@ -22,6 +22,14 @@ import (
 	"github.com/sourcegraph/log"
 )
 
+func TestMain(m *testing.M) {
+	if err := enableChildSubreaper(); err != nil {
+		fmt.Fprintf(os.Stderr, "enable child subreaper: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
 func TestServeUntilShutdownDrainsRequests(t *testing.T) {
 	slowStarted := make(chan struct{})
 	releaseSlow := make(chan struct{})
@@ -130,11 +138,13 @@ func TestServeUntilShutdownForcesOnDeadlineAndSecondSignal(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			started := make(chan struct{})
+			handlerDone := make(chan struct{})
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
 			server := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				defer close(handlerDone)
 				close(started)
 				<-r.Context().Done()
 			})}
@@ -149,7 +159,14 @@ func TestServeUntilShutdownForcesOnDeadlineAndSecondSignal(t *testing.T) {
 					test.preShutdownPause, 50*time.Millisecond,
 				)
 			}()
-			go http.Get("http://" + listener.Addr().String()) //nolint:errcheck
+			clientDone := make(chan error, 1)
+			go func() {
+				resp, err := http.Get("http://" + listener.Addr().String())
+				if resp != nil {
+					resp.Body.Close()
+				}
+				clientDone <- err
+			}()
 			<-started
 			signals <- syscall.SIGTERM
 			if test.secondSignal {
@@ -168,6 +185,19 @@ func TestServeUntilShutdownForcesOnDeadlineAndSecondSignal(t *testing.T) {
 			defer mu.Unlock()
 			if !stopped {
 				t.Fatal("workers were not stopped during forced shutdown")
+			}
+			select {
+			case <-handlerDone:
+			case <-time.After(time.Second):
+				t.Fatal("active handler did not stop after forced shutdown")
+			}
+			select {
+			case err := <-clientDone:
+				if err == nil {
+					t.Fatal("client request unexpectedly completed during forced shutdown")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("client request did not stop after forced shutdown")
 			}
 		})
 	}
@@ -220,6 +250,22 @@ func TestAcquireRejectsExitedWorker(t *testing.T) {
 	}
 }
 
+func TestDirectorStoresSelectedWorkerOnRequest(t *testing.T) {
+	w := &worker{ctx: context.Background(), port: 1234}
+	s := &stabilizer{
+		log:        log.Scoped("test", "test"),
+		workerPool: make(chan *worker, 1),
+	}
+	s.workerPool <- w
+	req := httptest.NewRequest(http.MethodGet, "http://stabilizer/request", nil)
+
+	s.director(req)
+
+	if got := req.Context().Value(workerContextKey{}); got != w {
+		t.Fatalf("request worker = %p, want %p", got, w)
+	}
+}
+
 func readPID(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -242,11 +288,9 @@ func assertProcessNotRunning(t *testing.T, pid int) {
 	t.Helper()
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err == nil {
-		fields := strings.Fields(string(data))
-		if len(fields) < 3 || fields[2] != "Z" {
-			t.Fatalf("worker child %d remains running: %s", pid, data)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("worker child %d was not reaped: %s", pid, data)
+	}
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("checking worker child %d: %v", pid, err)
 	}
 }
