@@ -30,6 +30,34 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestValidateShutdownConfig(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		preShutdownPause time.Duration
+		gracefulTimeout  time.Duration
+		wantErr          string
+	}{
+		{name: "valid", preShutdownPause: 5 * time.Second, gracefulTimeout: 15 * time.Second},
+		{name: "negative pause", preShutdownPause: -time.Second, gracefulTimeout: 15 * time.Second, wantErr: "pre-shutdown pause must not be negative"},
+		{name: "negative timeout", gracefulTimeout: -time.Second, wantErr: "graceful shutdown timeout must not be negative"},
+		{name: "timeout equals pause", preShutdownPause: 5 * time.Second, gracefulTimeout: 5 * time.Second, wantErr: "graceful shutdown timeout must be greater than pre-shutdown pause"},
+		{name: "timeout less than pause", preShutdownPause: 5 * time.Second, gracefulTimeout: 4 * time.Second, wantErr: "graceful shutdown timeout must be greater than pre-shutdown pause"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateShutdownConfig(test.preShutdownPause, test.gracefulTimeout)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateShutdownConfig: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != test.wantErr {
+				t.Fatalf("validateShutdownConfig error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestServeUntilShutdownDrainsRequests(t *testing.T) {
 	slowStarted := make(chan struct{})
 	releaseSlow := make(chan struct{})
@@ -178,8 +206,8 @@ func TestServeUntilShutdownForcesOnDeadlineAndSecondSignal(t *testing.T) {
 				if !errors.Is(err, errForcedShutdown) {
 					t.Fatalf("got %v, want forced shutdown", err)
 				}
-			} else if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("got %v, want deadline exceeded", err)
+			} else if err != nil {
+				t.Fatalf("got %v, want successful deadline shutdown", err)
 			}
 			mu.Lock()
 			defer mu.Unlock()

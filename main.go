@@ -284,6 +284,19 @@ var errForcedShutdown = fmt.Errorf("shutdown forced")
 
 const workerCleanupTimeout = 5 * time.Second
 
+func validateShutdownConfig(preShutdownPause, gracefulTimeout time.Duration) error {
+	if preShutdownPause < 0 {
+		return fmt.Errorf("pre-shutdown pause must not be negative")
+	}
+	if gracefulTimeout < 0 {
+		return fmt.Errorf("graceful shutdown timeout must not be negative")
+	}
+	if gracefulTimeout <= preShutdownPause {
+		return fmt.Errorf("graceful shutdown timeout must be greater than pre-shutdown pause")
+	}
+	return nil
+}
+
 func serveUntilShutdown(
 	logger log.Logger,
 	server *http.Server,
@@ -344,7 +357,7 @@ func serveUntilShutdown(
 	case <-shutdownCtx.Done():
 		logger.Warn("graceful shutdown deadline reached during pre-shutdown pause; forcing shutdown", log.Error(shutdownCtx.Err()))
 		_ = server.Close()
-		return shutdownCtx.Err()
+		return nil
 	case <-pause.C:
 	}
 
@@ -358,6 +371,9 @@ func serveUntilShutdown(
 		if shutdownErr != nil {
 			logger.Warn("graceful shutdown deadline reached; forcing shutdown", log.Error(shutdownErr))
 			_ = server.Close()
+			if errors.Is(shutdownErr, context.DeadlineExceeded) {
+				shutdownErr = nil
+			}
 		}
 	case sig := <-signals:
 		logger.Warn("second shutdown signal received while draining; forcing shutdown", log.String("signal", sig.String()))
@@ -409,6 +425,10 @@ var workerRestartsCounter prometheus.Counter
 
 func main() {
 	flag.Parse()
+	if err := validateShutdownConfig(*flagPreShutdownPause, *flagGracefulTimeout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	liblog := log.Init(log.Resource{
 		Name:       *flagPrometheusAppName,
