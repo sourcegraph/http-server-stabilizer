@@ -186,6 +186,10 @@ type stabilizer struct {
 
 type workerContextKey struct{}
 
+// handlingContextKey holds a context that ends when HSS finishes handling a
+// request, but not when the downstream caller disconnects.
+type handlingContextKey struct{}
+
 func templateArgs(args []string, port string) []string {
 	var v []string
 	for _, arg := range args {
@@ -387,20 +391,21 @@ func serveUntilShutdown(
 func (s *stabilizer) director(req *http.Request) {
 	timeout := *flagTimeout
 	if *flagTimeoutHeader != "" {
-		var err error
-		timeout, err = time.ParseDuration(req.Header.Get(*flagTimeoutHeader))
-		if err != nil {
-			timeout = *flagTimeout
+		if t, err := time.ParseDuration(req.Header.Get(*flagTimeoutHeader)); err == nil && t > 0 {
+			timeout = t
 		}
 	}
 
-	// We cannot cancel this timeout effectively within http.ReverseProxy director
-	ctx, _ := context.WithTimeout(req.Context(), timeout)
-	*req = *req.WithContext(ctx)
-
-	// Pull a worker from the pool and set it as our target.
+	// Pull a worker from the pool and set it as our target. The timeout starts
+	// only once a worker is acquired, so time spent waiting for one cannot get
+	// a healthy worker killed.
 	worker := s.acquire()
-	*req = *req.WithContext(context.WithValue(req.Context(), workerContextKey{}, worker))
+
+	// The worker request is deliberately detached from the downstream caller:
+	// a caller giving up does not stop the worker, so a context error while
+	// proxying means the timeout expired and the worker may be stuck.
+	ctx, _ := context.WithTimeout(req.Context().Value(handlingContextKey{}).(context.Context), timeout)
+	*req = *req.WithContext(context.WithValue(ctx, workerContextKey{}, worker))
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%v", worker.port))
 	s.log.Debug("handling request",
 		log.String("url", req.URL.String()),
@@ -419,6 +424,96 @@ func (s *stabilizer) director(req *http.Request) {
 		// explicitly disable User-Agent so it's not set to default value
 		req.Header.Set("User-Agent", "")
 	}
+}
+
+func (s *stabilizer) reverseProxy() http.Handler {
+	proxy := &httputil.ReverseProxy{
+		Director: s.director,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   2000 * time.Millisecond,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
+			// A worker may close its listener or exit while an idle connection is
+			// pooled. net/http can transparently retry that race only for
+			// replayable requests; proxied POST bodies are not replayable. Avoid
+			// assigning backend connections a lifetime beyond one request.
+			DisableKeepAlives: true,
+		},
+		ModifyResponse: func(r *http.Response) error {
+			// Set the X-Worker response header for debugging purposes.
+			w := r.Request.Context().Value(workerContextKey{}).(*worker)
+			s.release(w)
+			r.Header.Set("X-Worker", fmt.Sprint(w.pid))
+			return nil
+		},
+		ErrorHandler: s.handleProxyError,
+	}
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// Releases the worker request's timeout once the request is handled.
+		handling, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		proxy.ServeHTTP(rw, r.WithContext(context.WithValue(r.Context(), handlingContextKey{}, handling)))
+	})
+}
+
+func (s *stabilizer) handleProxyError(rw http.ResponseWriter, r *http.Request, err error) {
+	w := r.Context().Value(workerContextKey{}).(*worker)
+	s.release(w)
+	rw.Header().Set("X-Worker", fmt.Sprint(w.pid))
+	rw.WriteHeader(http.StatusServiceUnavailable)
+
+	// This error type matches what Rocket uses (the Rust server used by the
+	// syntect server).
+	type Err struct {
+		Code        int    `json:"code"`
+		Reason      string `json:"reason"`
+		Description string `json:"description"`
+	}
+
+	// The worker request's context ends only when its timeout expires (see
+	// director), so the worker may be stuck. Kill it; it will automatically
+	// restart.
+	if ctxErr := r.Context().Err(); ctxErr != nil {
+		w.log.Warn("restarting due to timeout", log.String("ctxErr", ctxErr.Error()))
+		if workerRestartsCounter != nil {
+			workerRestartsCounter.Inc()
+		}
+		w.cancel()
+		_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
+			"error": Err{
+				Code:        http.StatusServiceUnavailable,
+				Reason:      "hss_worker_timeout",
+				Description: fmt.Sprintf("Worker (pid: %v) failed to highlight file; restarting it", w.pid),
+			},
+		})
+		return
+	}
+
+	// The worker was stopped while serving this request, most likely because
+	// another request on it timed out. It is being restarted, so report this
+	// like a timeout rather than an unknown error.
+	if w.ctx.Err() != nil {
+		w.log.Warn("worker stopped while serving request", log.Error(err))
+		_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
+			"error": Err{
+				Code:        http.StatusServiceUnavailable,
+				Reason:      "hss_worker_timeout",
+				Description: fmt.Sprintf("Worker (pid: %v) was restarted while serving the request", w.pid),
+			},
+		})
+		return
+	}
+
+	w.log.Error("error encountered", log.Error(err))
+	_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
+		"error": Err{
+			Code:        http.StatusServiceUnavailable,
+			Reason:      "hss_worker_unknown_error",
+			Description: fmt.Sprintf("Worker (pid: %v) unknown error: %v", w.pid, err),
+		},
+	})
 }
 
 var workerRestartsCounter prometheus.Counter
@@ -496,75 +591,7 @@ func main() {
 	var workerWG sync.WaitGroup
 	s.ensureWorkers(workerCtx, &workerWG, *flagWorkers)
 
-	handler := &httputil.ReverseProxy{
-		Director: s.director,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   2000 * time.Millisecond,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-		ModifyResponse: func(r *http.Response) error {
-			// Set the X-Worker response header for debugging purposes.
-			w := r.Request.Context().Value(workerContextKey{}).(*worker)
-			s.release(w)
-			r.Header.Set("X-Worker", fmt.Sprint(w.pid))
-			return nil
-		},
-		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
-			// Set the X-Worker response header for debugging purposes.
-			w := r.Context().Value(workerContextKey{}).(*worker)
-			s.release(w)
-			rw.Header().Set("X-Worker", fmt.Sprint(w.pid))
-
-			rw.WriteHeader(http.StatusServiceUnavailable)
-
-			// This error type matches what Rocket uses (the Rust server
-			// we use in syntect server)
-			type Err struct {
-				// HTTP error code
-				Code int `json:"code"`
-				// Error string that can be matched on
-				Reason string `json:"reason"`
-				// PII-safe human-readable description, which can be used for logging
-				Description string `json:"description"`
-			}
-
-			// If the request timed out, kill the worker since it may be stuck.
-			// It will automatically restart.
-			if ctxErr := r.Context().Err(); ctxErr != nil {
-				w.log.Warn("restarting due to timeout", log.String("ctxErr", ctxErr.Error()))
-				workerRestartsCounter.Inc()
-				w.cancel()
-				_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
-					"error": Err{
-						Code:        http.StatusServiceUnavailable,
-						Reason:      "hss_worker_timeout",
-						Description: fmt.Sprintf("Worker (pid: %v) failed to highlight file; restarting it", w.pid),
-					},
-				})
-				return
-			}
-
-			// Technically we could hit other errors here if e.g. communication
-			// between our reverse proxy and the worker was failing for some
-			// other reason like the network being flooded, but in practice
-			// this is unlikely to happen and instead the most likely case is
-			// that the worker was killed due to another request on the same
-			// worker timing out. In this case, having a different error code
-			// to handle is not that useful so we also return
-			// hss_worker_timeout.
-			w.log.Error("error encountered", log.Error(err))
-			_ = json.NewEncoder(rw).Encode(&map[string]interface{}{
-				"error": Err{
-					Code:        http.StatusServiceUnavailable,
-					Reason:      "hss_worker_unknown_error",
-					Description: fmt.Sprintf("Worker (pid: %v) unknown error: %v", w.pid, err),
-				},
-			})
-		},
-	}
+	handler := s.reverseProxy()
 	listener, err := net.Listen("tcp", *flagListen)
 	if err != nil {
 		log.Scoped("server", "").Fatal("failed to listen", log.Error(err))
