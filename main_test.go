@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -287,11 +288,11 @@ func TestDirectorStoresSelectedWorkerOnRequest(t *testing.T) {
 	}
 	s.workerPool <- w
 	req := httptest.NewRequest(http.MethodGet, "http://stabilizer/request", nil)
-	req = req.WithContext(context.WithValue(req.Context(), handlingContextKey{}, context.Background()))
+	req = req.WithContext(context.WithValue(req.Context(), proxyRequestContextKey{}, &proxyRequest{}))
 
 	s.director(req)
 
-	if got := req.Context().Value(workerContextKey{}); got != w {
+	if got := req.Context().Value(proxyRequestContextKey{}).(*proxyRequest).worker; got != w {
 		t.Fatalf("request worker = %p, want %p", got, w)
 	}
 }
@@ -510,6 +511,38 @@ func TestProxyUsesFreshBackendConnectionPerRequest(t *testing.T) {
 	defer mu.Unlock()
 	if len(clientAddrs) != requests {
 		t.Fatalf("backend connections = %d, want one per request (%d)", len(clientAddrs), requests)
+	}
+}
+
+func TestInvalidUpgradeHeaderReleasesWorker(t *testing.T) {
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(rw, "ok")
+	}))
+	s.workerPool <- w
+
+	// ReverseProxy rejects a non-printable Upgrade header after the director
+	// has acquired a worker, and passes the downstream request to the error
+	// handler.
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxyURL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "POST / HTTP/1.1\r\nHost: hss\r\nConnection: Upgrade\r\nUpgrade: \xff\r\nContent-Length: 0\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+
+	// The only pool entry must be back: the next request is served.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if r := postThroughProxy(ctx, proxyURL, ""); r.err != nil || r.status != http.StatusOK || r.body != "ok" {
+		t.Fatalf("next request = %+v, want 200 ok (worker was not returned to the pool)", r)
 	}
 }
 

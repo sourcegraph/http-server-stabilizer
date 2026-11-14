@@ -184,11 +184,20 @@ type stabilizer struct {
 	workerPool chan *worker
 }
 
-type workerContextKey struct{}
+// proxyRequest tracks the worker serving one downstream request. It is
+// attached to the downstream request before the director runs, because
+// ReverseProxy passes either the downstream or the worker request to
+// ErrorHandler.
+type proxyRequest struct {
+	worker *worker
+	// ctx is the worker request's context. It is detached from the
+	// downstream caller and ends only when the stabilization timeout expires
+	// or HSS has finished handling the request.
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
-// handlingContextKey holds a context that ends when HSS finishes handling a
-// request, but not when the downstream caller disconnects.
-type handlingContextKey struct{}
+type proxyRequestContextKey struct{}
 
 func templateArgs(args []string, port string) []string {
 	var v []string
@@ -399,13 +408,15 @@ func (s *stabilizer) director(req *http.Request) {
 	// Pull a worker from the pool and set it as our target. The timeout starts
 	// only once a worker is acquired, so time spent waiting for one cannot get
 	// a healthy worker killed.
+	pr := req.Context().Value(proxyRequestContextKey{}).(*proxyRequest)
 	worker := s.acquire()
+	pr.worker = worker
 
 	// The worker request is deliberately detached from the downstream caller:
 	// a caller giving up does not stop the worker, so a context error while
 	// proxying means the timeout expired and the worker may be stuck.
-	ctx, _ := context.WithTimeout(req.Context().Value(handlingContextKey{}).(context.Context), timeout)
-	*req = *req.WithContext(context.WithValue(ctx, workerContextKey{}, worker))
+	pr.ctx, pr.cancel = context.WithTimeout(context.Background(), timeout)
+	*req = *req.WithContext(context.WithValue(pr.ctx, proxyRequestContextKey{}, pr))
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%v", worker.port))
 	s.log.Debug("handling request",
 		log.String("url", req.URL.String()),
@@ -443,23 +454,31 @@ func (s *stabilizer) reverseProxy() http.Handler {
 		},
 		ModifyResponse: func(r *http.Response) error {
 			// Set the X-Worker response header for debugging purposes.
-			w := r.Request.Context().Value(workerContextKey{}).(*worker)
-			s.release(w)
-			r.Header.Set("X-Worker", fmt.Sprint(w.pid))
+			pr := r.Request.Context().Value(proxyRequestContextKey{}).(*proxyRequest)
+			s.release(pr.worker)
+			r.Header.Set("X-Worker", fmt.Sprint(pr.worker.pid))
 			return nil
 		},
 		ErrorHandler: s.handleProxyError,
 	}
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// Releases the worker request's timeout once the request is handled.
-		handling, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		proxy.ServeHTTP(rw, r.WithContext(context.WithValue(r.Context(), handlingContextKey{}, handling)))
+		pr := &proxyRequest{}
+		defer func() {
+			// Release the worker request's timeout once it is handled.
+			if pr.cancel != nil {
+				pr.cancel()
+			}
+		}()
+		proxy.ServeHTTP(rw, r.WithContext(context.WithValue(r.Context(), proxyRequestContextKey{}, pr)))
 	})
 }
 
 func (s *stabilizer) handleProxyError(rw http.ResponseWriter, r *http.Request, err error) {
-	w := r.Context().Value(workerContextKey{}).(*worker)
+	// ReverseProxy calls this with the downstream request when it rejects the
+	// request after the director acquired a worker, such as for an invalid
+	// Upgrade header, and with the worker request otherwise.
+	pr := r.Context().Value(proxyRequestContextKey{}).(*proxyRequest)
+	w := pr.worker
 	s.release(w)
 	rw.Header().Set("X-Worker", fmt.Sprint(w.pid))
 	rw.WriteHeader(http.StatusServiceUnavailable)
@@ -475,7 +494,7 @@ func (s *stabilizer) handleProxyError(rw http.ResponseWriter, r *http.Request, e
 	// The worker request's context ends only when its timeout expires (see
 	// director), so the worker may be stuck. Kill it; it will automatically
 	// restart.
-	if ctxErr := r.Context().Err(); ctxErr != nil {
+	if ctxErr := pr.ctx.Err(); ctxErr != nil {
 		w.log.Warn("restarting due to timeout", log.String("ctxErr", ctxErr.Error()))
 		if workerRestartsCounter != nil {
 			workerRestartsCounter.Inc()
