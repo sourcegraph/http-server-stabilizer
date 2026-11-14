@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -273,24 +275,360 @@ func TestAcquireRejectsExitedWorker(t *testing.T) {
 	s.workerPool <- dead
 	s.workerPool <- live
 
-	if got := s.acquire(); got != live {
-		t.Fatal("acquired an exited worker")
+	if got, err := s.acquire(context.Background()); err != nil || got != live {
+		t.Fatalf("acquire = %p, %v; want live worker", got, err)
 	}
 }
 
-func TestDirectorStoresSelectedWorkerOnRequest(t *testing.T) {
+func TestDirectorTargetsRequestWorker(t *testing.T) {
 	w := &worker{ctx: context.Background(), port: 1234}
-	s := &stabilizer{
-		log:        log.Scoped("test", "test"),
-		workerPool: make(chan *worker, 1),
-	}
-	s.workerPool <- w
+	s := &stabilizer{log: log.Scoped("test", "test")}
 	req := httptest.NewRequest(http.MethodGet, "http://stabilizer/request", nil)
+	req = req.WithContext(context.WithValue(req.Context(), proxyRequestContextKey{}, &proxyRequest{worker: w}))
 
 	s.director(req)
 
-	if got := req.Context().Value(workerContextKey{}); got != w {
+	if req.URL.Host != "127.0.0.1:1234" {
+		t.Fatalf("request host = %q, want worker address", req.URL.Host)
+	}
+	if got := req.Context().Value(proxyRequestContextKey{}).(*proxyRequest).worker; got != w {
 		t.Fatalf("request worker = %p, want %p", got, w)
+	}
+}
+
+// startTestProxy runs the stabilizer's reverse proxy in front of one fake
+// worker served by handler. The worker is not added to the pool; tests add
+// pool entries themselves. Canceling the worker only cancels its context.
+func startTestProxy(t *testing.T, handler http.Handler) (string, *worker, *stabilizer) {
+	t.Helper()
+	backend := httptest.NewServer(handler)
+	t.Cleanup(backend.Close)
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(backendURL.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &worker{log: log.Scoped("test-worker", "test worker"), ctx: ctx, cancel: cancel, port: port, pid: 1234}
+	s := &stabilizer{log: log.Scoped("test", "test"), workerPool: make(chan *worker, 100)}
+	proxy := httptest.NewServer(s.reverseProxy())
+	t.Cleanup(proxy.Close)
+	return proxy.URL, w, s
+}
+
+type proxyResult struct {
+	status int
+	body   string
+	err    error
+}
+
+func postThroughProxy(ctx context.Context, proxyURL, stabilizeTimeout string) proxyResult {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL, strings.NewReader("body"))
+	if err != nil {
+		return proxyResult{err: err}
+	}
+	if stabilizeTimeout != "" {
+		req.Header.Set("X-Stabilize-Timeout", stabilizeTimeout)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return proxyResult{err: err}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return proxyResult{status: resp.StatusCode, body: string(body), err: err}
+}
+
+func errorReason(t *testing.T, r proxyResult) string {
+	t.Helper()
+	if r.err != nil {
+		t.Fatalf("request failed: %v", r.err)
+	}
+	var body struct {
+		Error struct {
+			Reason string `json:"reason"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &body); err != nil {
+		t.Fatalf("response %d %q is not an HSS error: %v", r.status, r.body, err)
+	}
+	return body.Error.Reason
+}
+
+func waitForWorkerRestart(t *testing.T, w *worker) {
+	t.Helper()
+	select {
+	case <-w.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker was not restarted")
+	}
+}
+
+func TestCallerCancellationDoesNotRestartWorker(t *testing.T) {
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprint(rw, "ok")
+	}))
+	s.workerPool <- w
+	s.workerPool <- w
+
+	// One caller gives up while a concurrent request is in flight on the
+	// same worker.
+	healthy := make(chan proxyResult, 1)
+	go func() { healthy <- postThroughProxy(context.Background(), proxyURL, "5s") }()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if r := postThroughProxy(ctx, proxyURL, "5s"); !errors.Is(r.err, context.DeadlineExceeded) {
+		t.Fatalf("canceled request = %+v, want caller deadline error", r)
+	}
+
+	if r := <-healthy; r.err != nil || r.status != http.StatusOK || r.body != "ok" {
+		t.Fatalf("concurrent request = %+v, want 200 ok", r)
+	}
+	select {
+	case <-w.ctx.Done():
+		t.Fatal("healthy worker was restarted because a caller gave up")
+	case <-time.After(400 * time.Millisecond): // let the canceled request's worker call finish
+	}
+}
+
+func TestStuckWorkerRestartsWhenCallerGivesUpFirst(t *testing.T) {
+	done := make(chan struct{})
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select { // stuck until HSS abandons the request
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	t.Cleanup(func() { close(done) })
+	s.workerPool <- w
+
+	// The caller's own timeout is shorter than HSS's, as with Sourcegraph's
+	// frontend; HSS must still detect and replace the stuck worker.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if r := postThroughProxy(ctx, proxyURL, "200ms"); !errors.Is(r.err, context.DeadlineExceeded) {
+		t.Fatalf("request = %+v, want caller deadline error", r)
+	}
+	waitForWorkerRestart(t, w)
+}
+
+func TestStabilizationTimeoutRestartsWorker(t *testing.T) {
+	done := make(chan struct{})
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	t.Cleanup(func() { close(done) })
+	s.workerPool <- w
+
+	r := postThroughProxy(context.Background(), proxyURL, "50ms")
+	if reason := errorReason(t, r); r.status != http.StatusServiceUnavailable || reason != "hss_worker_timeout" {
+		t.Fatalf("response = %d %q, want 503 hss_worker_timeout", r.status, reason)
+	}
+	waitForWorkerRestart(t, w)
+}
+
+func TestStabilizationTimeoutStartsAfterWorkerIsAcquired(t *testing.T) {
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(rw, "ok")
+	}))
+	go func() {
+		// The request waits for a free worker for longer than its timeout.
+		time.Sleep(200 * time.Millisecond)
+		s.workerPool <- w
+	}()
+
+	if r := postThroughProxy(context.Background(), proxyURL, "100ms"); r.err != nil || r.status != http.StatusOK {
+		t.Fatalf("response = %+v, want 200", r)
+	}
+	if w.ctx.Err() != nil {
+		t.Fatal("worker was restarted for time spent waiting to acquire it")
+	}
+}
+
+func TestNonPositiveStabilizeTimeoutUsesDefault(t *testing.T) {
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(rw, "ok")
+	}))
+	for _, header := range []string{"0", "0s", "-1s"} {
+		s.workerPool <- w
+		if r := postThroughProxy(context.Background(), proxyURL, header); r.err != nil || r.status != http.StatusOK {
+			t.Fatalf("X-Stabilize-Timeout %q: response = %+v, want 200", header, r)
+		}
+	}
+	if w.ctx.Err() != nil {
+		t.Fatal("non-positive X-Stabilize-Timeout restarted the worker")
+	}
+}
+
+func TestRequestOnRestartingWorkerReportsTimeout(t *testing.T) {
+	var w *worker
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		// Another request's timeout stops the worker while this request is in
+		// flight, so the connection closes without a response.
+		w.cancel()
+		if conn, _, err := rw.(http.Hijacker).Hijack(); err == nil {
+			conn.Close()
+		}
+	}))
+	s.workerPool <- w
+
+	r := postThroughProxy(context.Background(), proxyURL, "5s")
+	if reason := errorReason(t, r); r.status != http.StatusServiceUnavailable || reason != "hss_worker_timeout" {
+		t.Fatalf("response = %d %q, want 503 hss_worker_timeout", r.status, reason)
+	}
+}
+
+func TestProxyUsesFreshBackendConnectionPerRequest(t *testing.T) {
+	var mu sync.Mutex
+	clientAddrs := map[string]bool{}
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		clientAddrs[r.RemoteAddr] = true
+		mu.Unlock()
+		body, _ := io.ReadAll(r.Body)
+		rw.Write(body)
+	}))
+
+	// A pooled connection can be closed by the worker (idle timeout, restart)
+	// just as it is reused, which net/http cannot retry for a POST. Each
+	// request must therefore use its own backend connection.
+	const requests = 10
+	for i := 0; i < requests; i++ {
+		s.workerPool <- w
+		if r := postThroughProxy(context.Background(), proxyURL, ""); r.err != nil || r.status != http.StatusOK || r.body != "body" {
+			t.Fatalf("response = %+v, want 200 body", r)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(clientAddrs) != requests {
+		t.Fatalf("backend connections = %d, want one per request (%d)", len(clientAddrs), requests)
+	}
+}
+
+func TestCallerGivingUpWhileQueuedDoesNotUseWorker(t *testing.T) {
+	var mu sync.Mutex
+	var served []string
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		served = append(served, string(body))
+		mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprint(rw, "ok")
+	}))
+	s.workerPool <- w // one worker slot
+
+	// The first request holds the worker while the others queue behind it.
+	// Callers of the queued requests give up before the worker is free.
+	post := func(ctx context.Context, body string) proxyResult {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL, strings.NewReader(body))
+		req.Header.Set("X-Stabilize-Timeout", "5s")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return proxyResult{err: err}
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return proxyResult{status: resp.StatusCode, body: string(b)}
+	}
+	first := make(chan proxyResult, 1)
+	go func() { first <- post(context.Background(), "first") }()
+	time.Sleep(20 * time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			post(ctx, fmt.Sprintf("abandoned-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	if r := <-first; r.err != nil || r.status != http.StatusOK {
+		t.Fatalf("first request = %+v, want 200", r)
+	}
+
+	// A request with a live caller is served next, not after the abandoned ones.
+	start := time.Now()
+	if r := post(context.Background(), "live"); r.err != nil || r.status != http.StatusOK {
+		t.Fatalf("live request = %+v, want 200", r)
+	}
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Errorf("live request took %v, want about one request's work", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(served) != 2 || served[0] != "first" || served[1] != "live" {
+		t.Fatalf("worker served %q, want only [first live]", served)
+	}
+}
+
+func TestLargeRequestBodyIsStreamedToWorker(t *testing.T) {
+	want := strings.Repeat("0123456789", maxBufferedRequestBody/10+1000)
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != want {
+			http.Error(rw, fmt.Sprintf("got %d bytes, want %d", len(body), len(want)), http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(rw, "ok")
+	}))
+	for _, chunked := range []bool{false, true} {
+		s.workerPool <- w
+		var body io.Reader = strings.NewReader(want)
+		if chunked {
+			body = io.MultiReader(body) // unknown length: sent chunked
+		}
+		resp, err := http.Post(proxyURL, "text/plain", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("chunked=%v: response = %d %q, want 200", chunked, resp.StatusCode, got)
+		}
+	}
+}
+
+func TestInvalidUpgradeHeaderReleasesWorker(t *testing.T) {
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(rw, "ok")
+	}))
+	s.workerPool <- w
+
+	// ReverseProxy rejects a non-printable Upgrade header after the director
+	// has acquired a worker, and passes the downstream request to the error
+	// handler.
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxyURL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "POST / HTTP/1.1\r\nHost: hss\r\nConnection: Upgrade\r\nUpgrade: \xff\r\nContent-Length: 0\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+
+	// The only pool entry must be back: the next request is served.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if r := postThroughProxy(ctx, proxyURL, ""); r.err != nil || r.status != http.StatusOK || r.body != "ok" {
+		t.Fatalf("next request = %+v, want 200 ok (worker was not returned to the pool)", r)
 	}
 }
 
