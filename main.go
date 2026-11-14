@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -207,14 +208,55 @@ func templateArgs(args []string, port string) []string {
 	return v
 }
 
-func (s *stabilizer) acquire() *worker {
+// acquire takes a live worker from the pool, or returns ctx's error if ctx
+// ends first.
+func (s *stabilizer) acquire(ctx context.Context) (*worker, error) {
 	for {
-		w := <-s.workerPool
-		if w.ctx.Err() == nil {
-			return w
+		select {
+		case w := <-s.workerPool:
+			if w.ctx.Err() == nil {
+				return w, nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
+}
+
+// maxBufferedRequestBody is the largest request body read into memory before
+// waiting for a worker. net/http notices a caller disconnecting only after the
+// body has been read, so buffering it lets a queued request whose caller gave
+// up leave the queue without using a worker. Larger bodies are streamed.
+const maxBufferedRequestBody = 1 << 20
+
+// bufferRequestBody reads r's body into memory if it is at most
+// maxBufferedRequestBody bytes. Otherwise the bytes read so far are replayed
+// ahead of the rest of the body.
+func bufferRequestBody(r *http.Request) error {
+	if r.Body == nil || r.Body == http.NoBody || r.ContentLength > maxBufferedRequestBody {
+		return nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(r.Body, maxBufferedRequestBody+1))
+	if err != nil {
+		return err
+	}
+	if len(buf) > maxBufferedRequestBody {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(buf), r.Body), r.Body}
+		return nil
+	}
+	r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	r.ContentLength = int64(len(buf))
+	r.TransferEncoding = nil
+	return nil
 }
 
 func (s *stabilizer) release(w *worker) {
@@ -405,12 +447,11 @@ func (s *stabilizer) director(req *http.Request) {
 		}
 	}
 
-	// Pull a worker from the pool and set it as our target. The timeout starts
-	// only once a worker is acquired, so time spent waiting for one cannot get
-	// a healthy worker killed.
+	// The worker was acquired before ReverseProxy called the director, so
+	// time spent waiting for one does not count against the timeout and
+	// cannot get a healthy worker killed.
 	pr := req.Context().Value(proxyRequestContextKey{}).(*proxyRequest)
-	worker := s.acquire()
-	pr.worker = worker
+	worker := pr.worker
 
 	// The worker request is deliberately detached from the downstream caller:
 	// a caller giving up does not stop the worker, so a context error while
@@ -462,7 +503,18 @@ func (s *stabilizer) reverseProxy() http.Handler {
 		ErrorHandler: s.handleProxyError,
 	}
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		pr := &proxyRequest{}
+		if err := bufferRequestBody(r); err != nil {
+			s.log.Debug("reading request body", log.Error(err))
+			return
+		}
+		worker, err := s.acquire(r.Context())
+		if err != nil {
+			// The caller gave up while waiting for a worker; nobody is
+			// left to answer.
+			s.log.Debug("caller gave up while waiting for a worker", log.Error(err))
+			return
+		}
+		pr := &proxyRequest{worker: worker}
 		defer func() {
 			// Release the worker request's timeout once it is handled.
 			if pr.cancel != nil {

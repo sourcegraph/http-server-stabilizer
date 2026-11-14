@@ -275,23 +275,22 @@ func TestAcquireRejectsExitedWorker(t *testing.T) {
 	s.workerPool <- dead
 	s.workerPool <- live
 
-	if got := s.acquire(); got != live {
-		t.Fatal("acquired an exited worker")
+	if got, err := s.acquire(context.Background()); err != nil || got != live {
+		t.Fatalf("acquire = %p, %v; want live worker", got, err)
 	}
 }
 
-func TestDirectorStoresSelectedWorkerOnRequest(t *testing.T) {
+func TestDirectorTargetsRequestWorker(t *testing.T) {
 	w := &worker{ctx: context.Background(), port: 1234}
-	s := &stabilizer{
-		log:        log.Scoped("test", "test"),
-		workerPool: make(chan *worker, 1),
-	}
-	s.workerPool <- w
+	s := &stabilizer{log: log.Scoped("test", "test")}
 	req := httptest.NewRequest(http.MethodGet, "http://stabilizer/request", nil)
-	req = req.WithContext(context.WithValue(req.Context(), proxyRequestContextKey{}, &proxyRequest{}))
+	req = req.WithContext(context.WithValue(req.Context(), proxyRequestContextKey{}, &proxyRequest{worker: w}))
 
 	s.director(req)
 
+	if req.URL.Host != "127.0.0.1:1234" {
+		t.Fatalf("request host = %q, want worker address", req.URL.Host)
+	}
 	if got := req.Context().Value(proxyRequestContextKey{}).(*proxyRequest).worker; got != w {
 		t.Fatalf("request worker = %p, want %p", got, w)
 	}
@@ -511,6 +510,93 @@ func TestProxyUsesFreshBackendConnectionPerRequest(t *testing.T) {
 	defer mu.Unlock()
 	if len(clientAddrs) != requests {
 		t.Fatalf("backend connections = %d, want one per request (%d)", len(clientAddrs), requests)
+	}
+}
+
+func TestCallerGivingUpWhileQueuedDoesNotUseWorker(t *testing.T) {
+	var mu sync.Mutex
+	var served []string
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		served = append(served, string(body))
+		mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprint(rw, "ok")
+	}))
+	s.workerPool <- w // one worker slot
+
+	// The first request holds the worker while the others queue behind it.
+	// Callers of the queued requests give up before the worker is free.
+	post := func(ctx context.Context, body string) proxyResult {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL, strings.NewReader(body))
+		req.Header.Set("X-Stabilize-Timeout", "5s")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return proxyResult{err: err}
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return proxyResult{status: resp.StatusCode, body: string(b)}
+	}
+	first := make(chan proxyResult, 1)
+	go func() { first <- post(context.Background(), "first") }()
+	time.Sleep(20 * time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			post(ctx, fmt.Sprintf("abandoned-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	if r := <-first; r.err != nil || r.status != http.StatusOK {
+		t.Fatalf("first request = %+v, want 200", r)
+	}
+
+	// A request with a live caller is served next, not after the abandoned ones.
+	start := time.Now()
+	if r := post(context.Background(), "live"); r.err != nil || r.status != http.StatusOK {
+		t.Fatalf("live request = %+v, want 200", r)
+	}
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Errorf("live request took %v, want about one request's work", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(served) != 2 || served[0] != "first" || served[1] != "live" {
+		t.Fatalf("worker served %q, want only [first live]", served)
+	}
+}
+
+func TestLargeRequestBodyIsStreamedToWorker(t *testing.T) {
+	want := strings.Repeat("0123456789", maxBufferedRequestBody/10+1000)
+	proxyURL, w, s := startTestProxy(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != want {
+			http.Error(rw, fmt.Sprintf("got %d bytes, want %d", len(body), len(want)), http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(rw, "ok")
+	}))
+	for _, chunked := range []bool{false, true} {
+		s.workerPool <- w
+		var body io.Reader = strings.NewReader(want)
+		if chunked {
+			body = io.MultiReader(body) // unknown length: sent chunked
+		}
+		resp, err := http.Post(proxyURL, "text/plain", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("chunked=%v: response = %d %q, want 200", chunked, resp.StatusCode, got)
+		}
 	}
 }
 
